@@ -472,6 +472,9 @@ class Scheduler(SchedulerInterface):
         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        # Queued when pause(mode="wait") began, plus requests preempted
+        # while that pause is in effect. Admitted requests stay out of it.
+        self._pause_drain_ids: set[str] = set()
 
         # Remaining-block reservations of in-flight prefills gate async loads.
         # Parked async KV loads can number thousands, so theirs are cached until
@@ -1028,7 +1031,13 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
-            if self.cache_aware_window and not defer_prefills:
+            # Cache-aware reordering can move a request admitted after the
+            # pause ahead of one that still has to drain.
+            if (
+                self.cache_aware_window
+                and not defer_prefills
+                and self._pause_state != PauseState.PAUSED_NEW
+            ):
                 self._reorder_waiting_by_cached_prefix()
 
             step_skipped_waiting: deque[Request] = deque()
@@ -1056,6 +1065,15 @@ class Scheduler(SchedulerInterface):
             )
             # Cleared once self.async_kv_waiting's head can't start a load.
             take_async_kv = True
+            # Under PAUSED_NEW, leave only the pause drain in the waiting
+            # queues so a request admitted after the pause cannot be popped.
+            held_waiting: list[Request] = []
+            held_async_kv: list[Request] = []
+            if self._pause_state == PauseState.PAUSED_NEW:
+                held_waiting = self._hold_requests_outside_pause_drain(self.waiting)
+                held_async_kv = self._hold_requests_outside_pause_drain(
+                    self.async_kv_waiting
+                )
             while True:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -1064,10 +1082,10 @@ class Scheduler(SchedulerInterface):
                     num_running >= self.max_num_active_reqs or token_budget <= 0
                 )
                 if not loads_only:
-                    # Requests holding KV blocks are always drained first, and are
-                    # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
+                    # KV-holding requests drain first. Under PAUSED_NEW the
+                    # other waiting queues contain only the pause drain.
                     request_queue = self.kv_holding_waiting
-                    if not request_queue and self._pause_state == PauseState.UNPAUSED:
+                    if not request_queue:
                         request_queue = self._next_waiting_queue(take_async_kv)
                 elif (
                     take_async_kv
@@ -1645,6 +1663,10 @@ class Scheduler(SchedulerInterface):
                 self.waiting.prepend_requests(step_skipped_waiting)
             if step_skipped_async_kv:
                 self.async_kv_waiting.prepend_requests(step_skipped_async_kv)
+            for request in held_waiting:
+                self.waiting.add_request(request)
+            for request in held_async_kv:
+                self.async_kv_waiting.add_request(request)
 
             # DP prefill balancing: on a step that admitted prefills (release),
             # record whether it was capacity-bound.
@@ -1853,6 +1875,8 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
+        if self._pause_state == PauseState.PAUSED_NEW:
+            self._pause_drain_ids.add(request.request_id)
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
@@ -3159,7 +3183,39 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         logger.info("setting pause state to %s", pause_state.name)
+        if (
+            pause_state == PauseState.PAUSED_NEW
+            and self._pause_state != PauseState.PAUSED_NEW
+        ):
+            # Do not refresh this set on a repeated PAUSED_NEW: preemptions
+            # during the pause add to it, and a new snapshot would pick up
+            # requests admitted after the pause.
+            self._pause_drain_ids = {
+                request.request_id
+                for queue in (self.waiting, self.async_kv_waiting)
+                for request in queue
+            }
+        elif pause_state != PauseState.PAUSED_NEW:
+            self._pause_drain_ids.clear()
         self._pause_state = pause_state
+
+    def _hold_requests_outside_pause_drain(self, queue: RequestQueue) -> list[Request]:
+        """Remove requests admitted after the pause. The caller puts them back."""
+        drain_ids = self._pause_drain_ids
+        held = [request for request in queue if request.request_id not in drain_ids]
+        if held:
+            queue.remove_requests(held)
+        return held
+
+    def _num_pause_drain_waiting(self) -> int:
+        drain_ids = self._pause_drain_ids
+        if not drain_ids:
+            return 0
+        return sum(
+            request.request_id in drain_ids
+            for queue in (self.waiting, self.async_kv_waiting)
+            for request in queue
+        )
 
     def _request_blocks_can_be_freed(self, request: Request) -> bool:
         # We must defer freeing blocks if an async kv connector may
@@ -3236,8 +3292,9 @@ class Scheduler(SchedulerInterface):
             return 0
         num_running, num_waiting = self.get_request_counts()
         if self._pause_state == PauseState.PAUSED_NEW:
-            # Requests holding KV blocks still drain; queued ones stay queued.
-            num_waiting = len(self.kv_holding_waiting)
+            # Post-pause admissions stay queued. Requests queued before the
+            # pause, or preempted during it, still count until they finish.
+            num_waiting = len(self.kv_holding_waiting) + self._num_pause_drain_waiting()
         num_waiting -= self.num_waiting_for_streaming_input
         return num_waiting + num_running
 

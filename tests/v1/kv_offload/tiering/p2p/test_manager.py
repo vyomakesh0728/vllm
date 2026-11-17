@@ -1193,6 +1193,7 @@ class TestHasPendingWork:
             connector.connector_scheduler = connector_scheduler
             scheduler = object.__new__(Scheduler)
             scheduler._pause_state = PauseState.PAUSED_NEW
+            scheduler._pause_drain_ids = set()
             scheduler.running = []
             scheduler.waiting = []
             scheduler.kv_holding_waiting = []
@@ -1251,6 +1252,7 @@ class TestHasPendingWork:
             connector.connector_scheduler = connector_scheduler
             scheduler = object.__new__(Scheduler)
             scheduler._pause_state = PauseState.PAUSED_NEW
+            scheduler._pause_drain_ids = set()
             scheduler.running = []
             scheduler.waiting = []
             scheduler.kv_holding_waiting = []

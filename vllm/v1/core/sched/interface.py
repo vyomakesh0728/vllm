@@ -24,10 +24,11 @@ if TYPE_CHECKING:
 class PauseState(enum.IntEnum):
     """Scheduler pause state.
 
-    - UNPAUSED: Normal operation
-    - PAUSE_NEW: No new requests are scheduled, requests already in
-                 running state or holding KV blocks are scheduled.
-    - PAUSE_ALL: No requests are scheduled
+    - UNPAUSED: Normal operation.
+    - PAUSED_NEW: Requests admitted after the pause stay queued. Requests
+      already running, holding KV blocks, queued before the pause, or
+      preempted during the pause still run.
+    - PAUSED_ALL: No requests are scheduled.
     """
 
     UNPAUSED = 0

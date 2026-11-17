@@ -24,7 +24,7 @@ new requests are admitted while paused:
 | Mode | In-flight requests | New requests |
 | ---- | ------------------ | ------------ |
 | `"abort"` | Aborted immediately, returning partial results (default) | Rejected with HTTP 503 until resume |
-| `"wait"` | Running requests finish before the pause completes; queued ones run after resume | Rejected with HTTP 503 until resume |
+| `"wait"` | Requests already running or waiting, and any request preempted during the drain, finish before the pause completes | Rejected with HTTP 503 until resume |
 | `"keep"` | Frozen in the queue; they resume when `resume_generation` is called | Accepted and queued |
 
 `"abort"` and `"wait"` treat the pause as a generation boundary: from the moment

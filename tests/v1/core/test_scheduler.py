@@ -3706,6 +3706,129 @@ def test_pause_new_drains_async_kv_loads(load_done_before_pause: bool):
     assert queued.status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
 
+def _drain_pause_new(scheduler: Scheduler, blocked_id: str) -> None:
+    """Step until pause(mode="wait") reports idle. `blocked_id` must not run."""
+    for _ in range(12):
+        if scheduler.get_num_unfinished_requests() == 0:
+            return
+        output = scheduler.schedule()
+        assert blocked_id not in output.num_scheduled_tokens
+        scheduler.update_from_output(
+            output, _runner_output(list(output.num_scheduled_tokens))
+        )
+    raise AssertionError("pause drain did not go idle")
+
+
+def test_pause_new_drains_requests_waiting_before_pause():
+    """A request queued before pause(mode="wait") finishes before the drain
+    goes idle. A request admitted after the pause stays waiting."""
+    scheduler = create_scheduler(max_num_seqs=1)
+    (running,) = create_requests(
+        num_requests=1, num_tokens=8, max_tokens=1, req_ids=["running"]
+    )
+    (queued,) = create_requests(
+        num_requests=1, num_tokens=8, max_tokens=1, req_ids=["queued"]
+    )
+    scheduler.add_request(running)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, _runner_output([running.request_id]))
+    assert running.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+    scheduler.add_request(queued)
+    assert queued.status == RequestStatus.WAITING
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    (late,) = create_requests(
+        num_requests=1, num_tokens=8, max_tokens=1, req_ids=["late"]
+    )
+    scheduler.add_request(late)
+
+    _drain_pause_new(scheduler, late.request_id)
+
+    assert queued.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert late.status == RequestStatus.WAITING
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+def test_pause_new_drains_request_preempted_during_pause():
+    """A request preempted while pause(mode="wait") is draining finishes
+    before the drain goes idle, and is not aborted."""
+    # 10 usable blocks. Two 80-token prefills fill the cache, so the next
+    # decode of the first request preempts the second. Same shape as
+    # test_preempt_during_execution, with the pause set before that decode.
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+    )
+    survivor, victim = create_requests(
+        num_requests=2,
+        num_tokens=80,
+        block_size=16,
+        max_tokens=2,
+        req_ids=["survivor", "victim"],
+    )
+    scheduler.add_request(survivor)
+    survivor_prefill = scheduler.schedule()
+    scheduler.add_request(victim)
+    victim_prefill = scheduler.schedule()
+    scheduler.update_from_output(
+        survivor_prefill, _runner_output([survivor.request_id])
+    )
+
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    (late,) = create_requests(
+        num_requests=1, num_tokens=16, max_tokens=1, req_ids=["late"]
+    )
+    scheduler.add_request(late)
+
+    preempting = scheduler.schedule()
+    assert victim.status == RequestStatus.PREEMPTED
+    assert victim.num_preemptions == 1
+    assert late.request_id not in preempting.num_scheduled_tokens
+    scheduler.update_from_output(
+        preempting, _runner_output(list(preempting.num_scheduled_tokens))
+    )
+    scheduler.update_from_output(victim_prefill, _runner_output([victim.request_id]))
+
+    _drain_pause_new(scheduler, late.request_id)
+
+    assert survivor.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert victim.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert late.status == RequestStatus.WAITING
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
+def test_pause_new_skips_higher_priority_request_admitted_after_pause():
+    """A higher-priority request admitted after the pause stays queued while
+    an earlier, lower-priority request finishes."""
+    scheduler = create_scheduler_with_priority(max_num_seqs=1)
+    (early,) = create_requests_with_priority(
+        num_requests=1,
+        priorities=[2],
+        arrival_times=[1.0],
+        num_tokens=8,
+        max_tokens=1,
+        req_ids=["early"],
+    )
+    scheduler.add_request(early)
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    (late,) = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=8,
+        max_tokens=1,
+        req_ids=["late"],
+    )
+    scheduler.add_request(late)
+
+    _drain_pause_new(scheduler, late.request_id)
+
+    assert early.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert late.status == RequestStatus.WAITING
+
+
 def test_pause_new_ignores_streaming_session_waiting_for_input():
     """A session idle in WAITING_FOR_STREAMING_REQ cannot progress, so it must
     not keep a PAUSED_NEW drain from completing."""
